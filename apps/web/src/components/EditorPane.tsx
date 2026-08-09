@@ -8,6 +8,7 @@ import Placeholder from "@tiptap/extension-placeholder";
 import { TableKit } from "@tiptap/extension-table";
 import { useTranslation } from "react-i18next";
 import * as m from "motion/react-m";
+import "katex/dist/katex.min.css";
 import {
   ChevronLeft,
   ChevronRight,
@@ -34,6 +35,7 @@ import {
   FileDown,
   Printer,
   Link2,
+  Copy,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { GitHubRepositoryLink } from "@/components/GitHubRepositoryLink";
@@ -78,12 +80,14 @@ import { sanitizeAndScopeCss } from "@/lib/css-sandbox";
 import { RevisionHistoryDialog } from "./dialogs/RevisionHistoryDialog";
 import { ExternalLinkDialog } from "./dialogs/ExternalLinkDialog";
 import { memoShareQueryKey, ShareMemoDialog } from "./dialogs/ShareMemoDialog";
+import { AiAssistantDialog } from "./dialogs/AiAssistantDialog";
 import { api } from "@/lib/api";
 import { isDesktopResourceRuntime, stageDesktopResource, toDesktopResourceUrl } from "@/lib/desktop-resources";
 import { cn, formatDateTime, parseTagsText } from "@/lib/utils";
 import { EDITOR_CONTENT_MAX_WIDTH, EDITOR_CONTENT_MAX_WIDTH_COLLAPSED } from "@/lib/workspace-ui";
 import {
   countMemoCharacters,
+  createEdgeEverMathematics,
   docToMarkdown,
   MEMO_CONTENT_STYLE,
   markdownToDoc,
@@ -109,7 +113,7 @@ import {
   getMemoSaveConflictInfoFromQueueItem,
 } from "@/lib/memo-save-conflict";
 import { copyTextToClipboard } from "@/lib/clipboard";
-import { isLocalMemoId } from "@/lib/local-mirror";
+import { isLocalMemoId, remapLocalDraftMemoId } from "@/lib/local-mirror";
 import { shouldAcceptRemoteMemoDetail } from "@/lib/memo-detail-freshness";
 import type { EdgeEverRepository } from "@/lib/repository";
 import {
@@ -673,6 +677,7 @@ const RichEditorPane = ({
   const [imageUploadState, setImageUploadState] = useState<"idle" | "compressing" | "uploading" | "error">("idle");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [aiAssistantOpen, setAiAssistantOpen] = useState(false);
   const [systemInfoOpen, setSystemInfoOpen] = useState(false);
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const [mobileNotebookSheetOpen, setMobileNotebookSheetOpen] = useState(false);
@@ -722,6 +727,7 @@ const RichEditorPane = ({
   const [mobileImeDebugActiveElement, setMobileImeDebugActiveElement] = useState(getActiveElementLabel);
   const [mobileImeDebugEvents, setMobileImeDebugEvents] = useState<MobileImeDebugEntry[]>([]);
   const [wechatCopyState, setWechatCopyState] = useState<"idle" | "copying" | "copied" | "error">("idle");
+  const [memoIdCopyNotice, setMemoIdCopyNotice] = useState<{ status: "copied" | "error"; id: string } | null>(null);
   const noteLinkModifier = useMemo(
     () => typeof navigator !== "undefined" && /mac|iphone|ipad|ipod/i.test(navigator.platform) ? "⌘" : "Ctrl",
     []
@@ -840,11 +846,7 @@ const RichEditorPane = ({
       // A draft may already have been persisted during image processing.
       // Move it to the durable server id so a reload cannot orphan it under
       // the temporary id.
-      void localDb.drafts.get(previousMemoId).then(async (draft) => {
-        if (!draft) return;
-        await localDb.drafts.put({ ...draft, memoId: nextMemoId });
-        await localDb.drafts.delete(previousMemoId);
-      }).catch(() => {
+      void remapLocalDraftMemoId(previousMemoId, nextMemoId).catch(() => {
         // The live editor content remains authoritative; draft persistence can
         // retry on the next editor update.
       });
@@ -1029,6 +1031,7 @@ const RichEditorPane = ({
       }),
       EdgeEverCodeBlock.configure({ lowlight: codeBlockLowlight, defaultLanguage: "plaintext" }),
       MergeDivider,
+      ...createEdgeEverMathematics(),
       ThemeBlock,
       ResizableImage.configure({
         allowBase64: false,
@@ -1138,7 +1141,12 @@ const RichEditorPane = ({
         return true;
       },
     },
-  });
+  }, [
+    // A ProseMirror undo history belongs to exactly one memo. Reusing the same
+    // Editor instance across memo switches lets Ctrl/Cmd+Z undo the hydration
+    // transaction and restore another memo's entire document.
+    memo?.id,
+  ]);
 
   const insertMemoLink = useCallback((target: MemoSummary) => {
     if (!isEditorReady(editor) || effectiveReadOnly || target.id === memo?.id) {
@@ -1780,6 +1788,32 @@ const RichEditorPane = ({
     markDirtyStatus();
   }, [markDirtyStatus]);
 
+  const getCurrentMarkdownForAi = useCallback(() => {
+    if (useMobilePlainTextEditor) return getMobilePlainTextValue();
+    if (useMarkdownSourceEditor) return markdownSource;
+    return isEditorReady(editor)
+      ? docToMarkdown(editor.getJSON() as TiptapDoc)
+      : memoRef.current?.contentMarkdown ?? "";
+  }, [editor, getMobilePlainTextValue, markdownSource, useMarkdownSourceEditor, useMobilePlainTextEditor]);
+
+  const applyAiDraft = useCallback((draft: string, mode: "append" | "replace") => {
+    const current = getCurrentMarkdownForAi();
+    const next = mode === "append" && current.trim()
+      ? `${current.replace(/\s+$/, "")}\n\n${draft}`
+      : draft;
+    if (useMobilePlainTextEditor) {
+      setMobilePlainText(next);
+      setMobilePlainTextElementValue(mobileTextAreaRef.current, next);
+      persistCurrentDraft(title, tagsText, next);
+    } else if (useMarkdownSourceEditor) {
+      setMarkdownSource(next);
+    } else if (isEditorReady(editor)) {
+      editor.commands.setContent(markdownToDoc(next));
+    }
+    markDirty();
+    setAiAssistantOpen(false);
+  }, [editor, getCurrentMarkdownForAi, markDirty, persistCurrentDraft, tagsText, title, useMarkdownSourceEditor, useMobilePlainTextEditor]);
+
   const getCurrentContentJson = useCallback((): TiptapDoc | null => {
     if (useMobilePlainTextEditor) {
       return markdownToDoc(getMobilePlainTextValue());
@@ -2084,8 +2118,32 @@ const RichEditorPane = ({
 
   useEffect(() => {
     const handleSyncCompleted = (event: Event) => {
-      const result = (event as CustomEvent<{ failed?: number; conflicted?: number }>).detail;
+      const result = (event as CustomEvent<{
+        failed?: number;
+        conflicted?: number;
+        syncedMemos?: ReadonlyMap<string, MemoDetail>;
+      }>).detail;
       const memoId = memoRef.current?.id;
+
+      const syncedMemo = memoId ? result?.syncedMemos?.get(memoId) : null;
+      if (syncedMemo && memoRef.current?.id === syncedMemo.id) {
+        // Keep the live editor document, title, and tags intact while moving
+        // its concurrency base to the revision just acknowledged by this
+        // device. This closes the query-refresh window after an autosave.
+        memoRef.current = {
+          ...memoRef.current,
+          revision: syncedMemo.revision,
+          contentHash: syncedMemo.contentHash,
+          updatedAt: syncedMemo.updatedAt,
+        };
+        if (editSessionRef.current?.memoId === syncedMemo.id) {
+          editSessionRef.current = {
+            ...editSessionRef.current,
+            baseRevision: syncedMemo.revision,
+            baseContentHash: syncedMemo.contentHash,
+          };
+        }
+      }
 
       if (memoId && (result?.conflicted ?? 0) > 0) {
         void localDb.syncQueue.get(getMemoUpdateQueueId(memoId)).then((item) => {
@@ -2158,6 +2216,15 @@ const RichEditorPane = ({
       window.setTimeout(() => setWechatCopyState("idle"), 2600);
     }
   }, [editor, markdownSource, useMarkdownSourceEditor]);
+
+  const handleCopyMemoId = useCallback(async () => {
+    if (!memo || isLocalMemoId(memo.id)) {
+      return;
+    }
+    const copied = await copyTextToClipboard(memo.id);
+    setMemoIdCopyNotice({ status: copied ? "copied" : "error", id: memo.id });
+    window.setTimeout(() => setMemoIdCopyNotice(null), copied ? 2200 : 3000);
+  }, [memo]);
 
   const handleExportPdf = useCallback((preopenedWindow?: Window | null) => {
     if (!isEditorReady(editor) || !memo) {
@@ -3338,6 +3405,13 @@ const RichEditorPane = ({
                 <Search className="h-5 w-5" strokeWidth={2.25} />
               </Button>
             </IconTooltip>
+            {!readOnly && (
+              <IconTooltip label={t("aiAssistant.open")}>
+                <Button className="hidden h-8 w-8 text-emerald-600 transition-colors hover:bg-emerald-50 hover:text-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-300 sm:inline-flex" size="icon" variant="ghost" aria-label={t("aiAssistant.open")} onClick={() => setAiAssistantOpen(true)}>
+                  <Sparkles className="h-5 w-5" strokeWidth={2.25} />
+                </Button>
+              </IconTooltip>
+            )}
             <TooltipProvider delayDuration={0} skipDelayDuration={0}>
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -3410,12 +3484,29 @@ const RichEditorPane = ({
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44 bg-white border border-slate-200 rounded-md py-1 shadow-md">
+                {!readOnly && (
+                  <DropdownMenuItem
+                    className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-emerald-700 hover:bg-emerald-50 cursor-pointer outline-none"
+                    onClick={() => setAiAssistantOpen(true)}
+                  >
+                    <Sparkles className="h-4 w-4 text-emerald-600" />
+                    {t("aiAssistant.title")}
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem
                   className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
                   onClick={() => openNoteSearch()}
                 >
                   <Search className="h-4 w-4 text-slate-500" />
                   {t("editor.searchCurrentMemo")}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
+                  disabled={isLocalMemoId(memo.id)}
+                  onClick={() => void handleCopyMemoId()}
+                >
+                  <Copy className="h-4 w-4 text-slate-500" />
+                  {t(isLocalMemoId(memo.id) ? "editor.copyNoteIdAfterSync" : "editor.copyNoteId")}
                 </DropdownMenuItem>
                 <DropdownMenuItem
                   className="flex h-9 w-full items-center gap-2 px-3 text-left text-sm text-slate-700 hover:bg-slate-50 cursor-pointer outline-none"
@@ -3511,7 +3602,7 @@ const RichEditorPane = ({
               persistCurrentDraft(event.target.value, tagsText, getMobilePlainTextValue());
               markDirty();
             }}
-            className="block w-full rounded-md border-0 bg-transparent text-2xl font-bold leading-tight text-slate-950 outline-none transition placeholder:text-slate-300 focus-visible:bg-slate-50 focus-visible:shadow-[inset_3px_0_0_var(--brand-green)] sm:text-3xl"
+            className="block w-full rounded-md border-0 bg-transparent text-2xl font-bold leading-tight text-slate-950 outline-none transition placeholder:text-slate-300 focus-visible:bg-muted focus-visible:shadow-[inset_3px_0_0_var(--brand-green)] sm:text-3xl"
             placeholder={t("common.untitledMemo")}
           />
           <div className="flex flex-wrap items-center gap-2">
@@ -3726,6 +3817,7 @@ const RichEditorPane = ({
             ? {
                 "--editor-theme-bg": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).background,
                 "--editor-theme-text": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).text,
+                "--editor-theme-muted": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).muted,
                 "--editor-theme-heading": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).heading,
                 "--editor-theme-accent": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).accent,
                 "--editor-theme-soft": (resolvedTheme === "dark" ? customEditorTheme.dark : customEditorTheme.light).soft,
@@ -3974,6 +4066,18 @@ const RichEditorPane = ({
         </div>
       )}
 
+      {memoIdCopyNotice && (
+        <div
+          className={cn(
+            "fixed bottom-5 left-1/2 z-[120] max-w-[calc(100vw-2rem)] -translate-x-1/2 truncate rounded-md px-3 py-2 text-sm font-medium text-white shadow-lg",
+            memoIdCopyNotice.status === "copied" ? "bg-emerald-700" : "bg-rose-600",
+          )}
+          role={memoIdCopyNotice.status === "copied" ? "status" : "alert"}
+        >
+          {t(memoIdCopyNotice.status === "copied" ? "editor.noteIdCopied" : "editor.noteIdCopyFailed", { id: memoIdCopyNotice.id })}
+        </div>
+      )}
+
       {false && useMobilePlainTextEditor && (
         <div className="fixed left-2 right-2 top-[max(3.5rem,env(safe-area-inset-top))] z-[70] rounded-md border border-amber-200 bg-amber-50/95 p-2 text-[11px] text-slate-800 shadow-lg backdrop-blur sm:hidden">
           <div className="flex items-center justify-between gap-2">
@@ -4085,6 +4189,14 @@ const RichEditorPane = ({
       )}
 
       <SystemInfoDialog open={systemInfoOpen} onOpenChange={setSystemInfoOpen} />
+
+      <AiAssistantDialog
+        open={aiAssistantOpen}
+        title={title}
+        contentMarkdown={getCurrentMarkdownForAi()}
+        onOpenChange={setAiAssistantOpen}
+        onApply={applyAiDraft}
+      />
 
       <ShareMemoDialog memoId={memo.id} open={shareOpen} onOpenChange={setShareOpen} />
 

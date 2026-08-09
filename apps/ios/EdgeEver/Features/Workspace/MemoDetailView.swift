@@ -1,18 +1,19 @@
 import SwiftUI
 import Pow
+import UIKit
 
 /// Android WorkspaceMemoDetail shell parity (detailHeader*, detailMeta*, detailEditFab).
 struct MemoDetailView: View {
     @Environment(AppEnvironment.self) private var env
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
     let memoId: String
     /// Present editor from the parent `WorkspaceView` (more reliable than cover on a pushed page).
     var onEdit: (String) -> Void = { _ in }
 
     @State private var memo: MemoDetail?
     @State private var showRevisions = false
-    @State private var showShareAlert = false
-    @State private var shareURL: String?
+    @State private var memoSharePayload: MemoSharePayload?
     @State private var error: String?
     @State private var conflictItem: OutboxItem?
     @State private var outboxStatus: OutboxStatus?
@@ -20,8 +21,11 @@ struct MemoDetailView: View {
     @State private var pinPulse = false
     @State private var searchOpen = false
     @State private var searchQuery = ""
+    @State private var searchMatchCount = 0
+    @State private var searchMatchIndex = 0
     @State private var showDeleteConfirm = false
     @State private var showMoreMenu = false
+    @State private var showNoteIdCopied = false
     @State private var resourceTarget: ResourceTarget?
     @State private var imagePreview: (source: String, alt: String)?
     /// TipTap EditorBundle is ~4MB; keep native text visible until first setContent finishes.
@@ -49,7 +53,7 @@ struct MemoDetailView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .background(Color.white)
+        .background(AppTheme.card)
         // UIKit FAB in overlay — SwiftUI Button over WKWebView often receives zero taps.
         .overlay(alignment: .bottomTrailing) {
             if let memo, !memo.isDeleted {
@@ -63,7 +67,7 @@ struct MemoDetailView: View {
                 .padding(.bottom, 12)
             }
         }
-        .background(Color.white.ignoresSafeArea())
+        .background(AppTheme.card.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .accessibilityIdentifier(DetailMemoChrome.root)
         .sheet(isPresented: $showRevisions) {
@@ -93,6 +97,12 @@ struct MemoDetailView: View {
             )
             .presentationDetents([.height(360), .medium])
             .presentationDragIndicator(.hidden)
+        }
+        .sheet(item: $memoSharePayload) { payload in
+            ActivityShareView(items: [payload.message, payload.url]) { _, _, error in
+                if let error { self.error = error.localizedDescription }
+                memoSharePayload = nil
+            }
         }
         .fullScreenCover(isPresented: Binding(
             get: { imagePreview != nil },
@@ -136,6 +146,15 @@ struct MemoDetailView: View {
                 Button(env.preferences.t("分享链接", en: "Share link")) {
                     Task { await shareMemo(memo) }
                 }
+                Button(
+                    isTemporaryMemoId(memo.id)
+                        ? env.preferences.t("同步后可复制笔记 ID", en: "Copy note ID after sync")
+                        : env.preferences.t("复制笔记 ID", en: "Copy note ID")
+                ) {
+                    UIPasteboard.general.string = memo.id
+                    showNoteIdCopied = true
+                }
+                .disabled(isTemporaryMemoId(memo.id))
                 Button(env.preferences.t("修订历史", en: "Revisions")) { showRevisions = true }
                 Button(env.preferences.t("删除", en: "Delete"), role: .destructive) {
                     showDeleteConfirm = true
@@ -150,15 +169,13 @@ struct MemoDetailView: View {
         } message: {
             Text(env.preferences.t("笔记将移入回收站。", en: "The note will move to trash."))
         }
-        .alert(env.preferences.t("分享链接", en: "Share link"), isPresented: $showShareAlert) {
-            Button(env.preferences.t("复制", en: "Copy")) {
-                if let shareURL {
-                    UIPasteboard.general.string = shareURL
-                }
-            }
-            Button(env.preferences.t("关闭", en: "Close"), role: .cancel) {}
+        .alert(
+            env.preferences.t("笔记 ID 已复制", en: "Note ID copied"),
+            isPresented: $showNoteIdCopied
+        ) {
+            Button(env.preferences.t("好", en: "OK"), role: .cancel) {}
         } message: {
-            Text(shareURL ?? "")
+            Text(memo?.id ?? memoId)
         }
         // Local SQLite mirror is sync and cheap — load before the first blank ProgressView frame.
         .onAppear {
@@ -180,6 +197,9 @@ struct MemoDetailView: View {
         }
         .onChange(of: memoId) { _, _ in
             bodyReady = false
+            searchQuery = ""
+            searchMatchCount = 0
+            searchMatchIndex = 0
             load()
             refreshSyncStatus()
         }
@@ -244,7 +264,13 @@ struct MemoDetailView: View {
                         label: env.preferences.t("搜索当前笔记", en: "Search in note"),
                         id: DetailMemoChrome.search
                     ) {
-                        withAnimation(Motion.chip) { searchOpen.toggle() }
+                        withAnimation(Motion.chip) {
+                            if searchOpen {
+                                closeSearch()
+                            } else {
+                                searchOpen = true
+                            }
+                        }
                     }
                     headerIconButton(
                         systemImage: "ellipsis",
@@ -259,7 +285,7 @@ struct MemoDetailView: View {
         }
         .padding(.horizontal, 12)
         .frame(minHeight: 48)
-        .background(Color.white)
+        .background(AppTheme.card)
         .overlay(alignment: .bottom) {
             Rectangle().fill(AppTheme.cardBorder).frame(height: 1)
         }
@@ -293,13 +319,13 @@ struct MemoDetailView: View {
                 en: "This note changed on another device or while offline. Copy the local draft, then adopt the cloud version to continue."
             ))
             .font(.system(size: 12))
-            .foregroundStyle(Color(hex: 0x9F1239))
+            .foregroundStyle(AppTheme.dangerStrong)
             .fixedSize(horizontal: false, vertical: true)
 
             if let lastOutboxError, !lastOutboxError.isEmpty {
                 Text(lastOutboxError)
                     .font(.system(size: 12))
-                    .foregroundStyle(Color(hex: 0x9F1239))
+                    .foregroundStyle(AppTheme.dangerStrong)
             }
 
             HStack(spacing: 8) {
@@ -316,7 +342,7 @@ struct MemoDetailView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
-                        .background(Color(hex: 0xBE123C))
+                        .background(AppTheme.dangerAction)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
@@ -326,13 +352,13 @@ struct MemoDetailView: View {
                 } label: {
                     Text(env.preferences.t("复制本地草稿", en: "Copy local draft"))
                         .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(Color(hex: 0x9F1239))
+                        .foregroundStyle(AppTheme.dangerStrong)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
-                        .background(Color.white)
+                        .background(AppTheme.card)
                         .overlay(
                             RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color(hex: 0xFECDD3), lineWidth: 1)
+                                .stroke(AppTheme.dangerBorder, lineWidth: 1)
                         )
                 }
                 .buttonStyle(.plain)
@@ -341,9 +367,9 @@ struct MemoDetailView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(hex: 0xFFF1F2))
+        .background(AppTheme.dangerSurface)
         .overlay(alignment: .bottom) {
-            Rectangle().fill(Color(hex: 0xFECDD3)).frame(height: 0.5)
+            Rectangle().fill(AppTheme.dangerBorder).frame(height: 0.5)
         }
     }
 
@@ -357,7 +383,7 @@ struct MemoDetailView: View {
                         : env.preferences.t("本地改动待上传。下拉刷新或点此可立即同步。", en: "Local changes pending upload. Pull to refresh or tap to sync now."))
             )
             .font(.system(size: 12))
-            .foregroundStyle(isError ? Color(hex: 0x991B1B) : Color(hex: 0x1E3A8A))
+            .foregroundStyle(isError ? AppTheme.dangerStrong : AppTheme.infoText)
             .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
@@ -375,7 +401,7 @@ struct MemoDetailView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 8)
-                        .background(isError ? Color(hex: 0xB91C1C) : Color(hex: 0x1D4ED8))
+                        .background(isError ? AppTheme.dangerAction : AppTheme.infoAction)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
@@ -386,13 +412,13 @@ struct MemoDetailView: View {
                     } label: {
                         Text(env.preferences.t("复制本地草稿", en: "Copy local draft"))
                             .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(Color(hex: 0x991B1B))
+                            .foregroundStyle(AppTheme.dangerStrong)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
-                            .background(Color.white)
+                            .background(AppTheme.card)
                             .overlay(
                                 RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color(hex: 0xFECACA), lineWidth: 1)
+                                    .stroke(AppTheme.dangerBorder, lineWidth: 1)
                             )
                     }
                     .buttonStyle(.plain)
@@ -402,10 +428,10 @@ struct MemoDetailView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isError ? Color(hex: 0xFEF2F2) : Color(hex: 0xEFF6FF))
+        .background(isError ? AppTheme.dangerSurface : AppTheme.infoSurface)
         .overlay(alignment: .bottom) {
             Rectangle()
-                .fill(isError ? Color(hex: 0xFECACA) : Color(hex: 0xBFDBFE))
+                .fill(isError ? AppTheme.dangerBorder : AppTheme.infoText.opacity(0.55))
                 .frame(height: 0.5)
         }
     }
@@ -421,7 +447,7 @@ struct MemoDetailView: View {
                             .font(.system(size: 16))
                             .foregroundStyle(AppTheme.secondary)
                     }
-                    Text(memo.displayTitle)
+                    Text(localizedTitle(for: memo))
                         .font(.system(size: 24, weight: .bold))
                         .foregroundStyle(AppTheme.title)
                         .lineLimit(4)
@@ -477,9 +503,40 @@ struct MemoDetailView: View {
                         )
                         .font(.system(size: 14))
                         .textFieldStyle(.plain)
+                        .onChange(of: searchQuery) { _, query in
+                            searchMatchIndex = 0
+                            SharedTipTapRuntime.viewer.search(query, index: 0)
+                        }
+                        Text(searchMatchCount == 0 ? "0/0" : "\(searchMatchIndex + 1)/\(searchMatchCount)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AppTheme.secondary)
+                            .monospacedDigit()
                         Button {
-                            searchOpen = false
-                            searchQuery = ""
+                            guard searchMatchCount > 0 else { return }
+                            let next = (searchMatchIndex - 1 + searchMatchCount) % searchMatchCount
+                            SharedTipTapRuntime.viewer.search(searchQuery, index: next)
+                        } label: {
+                            Image(systemName: "chevron.up")
+                                .font(.system(size: 12, weight: .bold))
+                                .frame(width: 28, height: 28)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(searchMatchCount == 0)
+                        .accessibilityLabel(env.preferences.t("上一个匹配项", en: "Previous match"))
+                        Button {
+                            guard searchMatchCount > 0 else { return }
+                            let next = (searchMatchIndex + 1) % searchMatchCount
+                            SharedTipTapRuntime.viewer.search(searchQuery, index: next)
+                        } label: {
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 12, weight: .bold))
+                                .frame(width: 28, height: 28)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(searchMatchCount == 0)
+                        .accessibilityLabel(env.preferences.t("下一个匹配项", en: "Next match"))
+                        Button {
+                            closeSearch()
                         } label: {
                             Image(systemName: "xmark")
                                 .font(.system(size: 12, weight: .bold))
@@ -516,12 +573,20 @@ struct MemoDetailView: View {
                     markdown: memo.contentMarkdown,
                     baseURL: env.session.session.flatMap { URL(string: $0.baseUrl) },
                     token: env.session.session?.token,
+                    locale: env.preferences.isEnglish ? "en-US" : "zh-CN",
+                    theme: colorScheme == .dark ? "dark" : "light",
+                    placeholder: env.preferences.t("开始输入…", en: "Start writing…"),
                     onChange: nil,
                     onResourcePress: { target in
                         resourceTarget = target
                     },
                     onImagePreview: { source, alt in
                         imagePreview = (source, alt)
+                    },
+                    onPickImage: nil,
+                    onSearchResult: { count, index in
+                        searchMatchCount = count
+                        searchMatchIndex = index
                     },
                     onBodyReady: {
                         bodyReady = true
@@ -532,7 +597,7 @@ struct MemoDetailView: View {
                     ProgressView()
                         .tint(AppTheme.title)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.white.opacity(0.92))
+                        .background(AppTheme.card.opacity(0.92))
                         .allowsHitTesting(false)
                 }
             }
@@ -620,8 +685,25 @@ struct MemoDetailView: View {
 
     private func copyLocalDraft() async {
         guard let memo else { return }
-        let text = [memo.displayTitle, memo.contentMarkdown].filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let text = [localizedTitle(for: memo), memo.contentMarkdown].filter { !$0.isEmpty }.joined(separator: "\n\n")
         UIPasteboard.general.string = text
+    }
+
+    private func isTemporaryMemoId(_ id: String) -> Bool {
+        id.hasPrefix("local:") || id.hasPrefix("local_")
+    }
+
+    private func closeSearch() {
+        searchOpen = false
+        searchQuery = ""
+        searchMatchCount = 0
+        searchMatchIndex = 0
+        SharedTipTapRuntime.viewer.search("", index: 0)
+    }
+
+    private func localizedTitle(for memo: MemoDetail) -> String {
+        let title = memo.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return title.isEmpty ? env.preferences.t("无标题笔记", en: "Untitled note") : title
     }
 
     private func togglePin(_ memo: MemoDetail) async {
@@ -649,8 +731,12 @@ struct MemoDetailView: View {
         do {
             let share = try await env.session.client.createMemoShare(memoId: memo.id)
             let base = env.session.session?.baseUrl.trimmingCharacters(in: CharacterSet(charactersIn: "/")) ?? ""
-            shareURL = "\(base)/share/\(share.token)"
-            showShareAlert = true
+            guard let url = URL(string: "\(base)/share/\(share.token)") else { return }
+            let title = memo.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let displayTitle = title?.isEmpty == false
+                ? title!
+                : env.preferences.t("无标题笔记", en: "Untitled note")
+            memoSharePayload = MemoSharePayload(message: "\(displayTitle)\n\(url.absoluteString)", url: url)
         } catch {
             self.error = error.localizedDescription
         }
@@ -671,6 +757,12 @@ struct MemoDetailView: View {
             self.error = error.localizedDescription
         }
     }
+}
+
+private struct MemoSharePayload: Identifiable {
+    let id = UUID()
+    let message: String
+    let url: URL
 }
 
 // MARK: - String helper
