@@ -17,7 +17,17 @@ struct TipTapSession {
     var onImagePreview: ((_ source: String, _ alt: String) -> Void)?
     var onPickImage: (() -> Void)?
     var onSearchResult: ((_ count: Int, _ index: Int) -> Void)?
+    var onImageExportEvent: (([String: Any]) -> Void)?
     var onBodyReady: (() -> Void)?
+}
+
+struct AiEditorSelection: Decodable, Sendable, Identifiable {
+    var from: Int
+    var to: Int
+    var markdown: String
+    var text: String
+
+    var id: String { "\(from):\(to)" }
 }
 
 /// One long-lived TipTap WKWebView per mode (viewer / editor).
@@ -133,7 +143,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             needsForcePushOnBind = true
         }
         // Drop action callbacks for the dismantled SwiftUI host so late JS `change`
-        // events cannot rewrite the next create draft with this session's body.
+        // events cannot rewrite a later editor session with this session's body.
         if var s = session {
             s.onChange = nil
             s.onResourcePress = nil
@@ -203,6 +213,57 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         })();
         """
         webView.evaluateJavaScript(js, completionHandler: nil)
+    }
+
+    /// Capture the current non-empty editor selection and keep its range in the JS runtime.
+    func captureAiSelection() async -> AiEditorSelection? {
+        guard ready, session?.mode == .editor else { return nil }
+        let raw: Any? = await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(
+                "window.EdgeEverEditor && window.EdgeEverEditor.captureSelection ? window.EdgeEverEditor.captureSelection() : null"
+            ) { value, _ in
+                continuation.resume(returning: value)
+            }
+        }
+        guard let json = raw as? String,
+              let data = json.data(using: .utf8)
+        else { return nil }
+        return try? JSONDecoder().decode(AiEditorSelection.self, from: data)
+    }
+
+    /// Insert after or replace the range captured by `captureAiSelection()`.
+    func applyAiSelectionDraft(_ markdown: String, append: Bool) async -> Bool {
+        guard ready, session?.mode == .editor, !markdown.isEmpty else { return false }
+        let markdownB64 = Data(markdown.utf8).base64EncodedString()
+        let modeValue = append ? "append" : "replace"
+        let js = """
+        (function(){
+          try {
+            if (!window.EdgeEverEditor || !window.EdgeEverEditor.applySelectionDraft) return false;
+            var bin = atob('\(markdownB64)');
+            var bytes = new Uint8Array(bin.length);
+            for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            var markdown = new TextDecoder('utf-8').decode(bytes);
+            return window.EdgeEverEditor.applySelectionDraft(markdown, '\(modeValue)') === true;
+          } catch (e) { return false; }
+        })();
+        """
+        return await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(js) { value, _ in
+                continuation.resume(returning: (value as? Bool) ?? false)
+            }
+        }
+    }
+
+    func undoAiSelectionDraft() async -> Bool {
+        guard ready, session?.mode == .editor else { return false }
+        return await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(
+                "window.EdgeEverEditor && window.EdgeEverEditor.undo ? window.EdgeEverEditor.undo() : false"
+            ) { value, _ in
+                continuation.resume(returning: (value as? Bool) ?? false)
+            }
+        }
     }
 
     private func focusEnd(attempt: Int) {
@@ -350,6 +411,29 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
         let json = obj["json"] as? String ?? ""
         guard !json.isEmpty || !md.isEmpty else { return nil }
         return (md, json)
+    }
+
+    func exportNoteImage(request: [String: Any]) {
+        guard ready,
+              JSONSerialization.isValidJSONObject(request),
+              let data = try? JSONSerialization.data(withJSONObject: request),
+              let json = String(data: data, encoding: .utf8)
+        else { return }
+        let requestId = request["requestId"] as? String ?? ""
+        let requestIdLiteral = String(data: (try? JSONSerialization.data(withJSONObject: requestId, options: .fragmentsAllowed)) ?? Data("\"\"".utf8), encoding: .utf8) ?? "\"\""
+        let js = """
+        (function(){
+          try {
+            if (!window.EdgeEverEditor || !window.EdgeEverEditor.exportImage) return false;
+            window.EdgeEverEditor.exportImage(\(json));
+            return true;
+          } catch (e) {
+            try { window.webkit.messageHandlers.edgeever.postMessage({type:'imageExportError', requestId:\(requestIdLiteral), message:String(e)}); } catch (_) {}
+            return false;
+          }
+        })();
+        """
+        webView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func scheduleFocusEnd(for generation: UInt64) {
@@ -575,7 +659,7 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             pushContentIfNeeded(force: true)
         case "change":
             // Host dismantled (create/edit dismissed) — drop late events so they cannot
-            // resurrect the previous body into a new-note draft via onChange autosave.
+            // resurrect the previous body in a later editor session.
             guard let session, session.onChange != nil else { return }
             let md = body["contentMarkdown"] as? String ?? ""
             let json = body["contentJson"] as? String ?? session.documentJSON
@@ -611,6 +695,9 @@ final class SharedTipTapRuntime: NSObject, WKScriptMessageHandler, WKNavigationD
             let index = (body["index"] as? NSNumber)?.intValue ?? 0
             let cb = session?.onSearchResult
             DispatchQueue.main.async { cb?(count, index) }
+        case "imageExportChunk", "imageExportComplete", "imageExportError":
+            let cb = session?.onImageExportEvent
+            DispatchQueue.main.async { cb?(body) }
         default:
             break
         }

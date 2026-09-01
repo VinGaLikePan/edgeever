@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import EdgeEver
 
@@ -99,6 +100,11 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertTrue(src.contains("CreateMemoChrome.metaRow"), "missing meta row")
         XCTAssertTrue(src.contains("CreateMemoChrome.notebook"), "missing notebook control")
         XCTAssertTrue(src.contains("CreateMemoChrome.tags"), "missing tags field")
+        XCTAssertTrue(src.contains("CreateMemoChrome.smartTags"), "missing one-tap smart tags control")
+        XCTAssertTrue(src.contains("generateAndApplySmartTags"), "smart tags must generate and apply in one action")
+        XCTAssertTrue(src.contains("tag.badge.plus"), "smart tags must use the same tag-plus metaphor as web and Android")
+        XCTAssertFalse(src.contains("Image(systemName: \"tag\")"), "tags field must not repeat the tag icon beside the smart-tags control")
+        XCTAssertFalse(src.contains("AI 推荐标签"), "tag picker must not retain the multi-step AI suggestion flow")
         XCTAssertTrue(src.contains("CreateMemoChrome.editorFrame"), "missing bordered editor")
         XCTAssertTrue(src.contains("TipTapWebView"), "editor wiring must remain")
         XCTAssertTrue(src.contains("commitCreate") || src.contains("persistDraftOrQueue"), "save path must remain")
@@ -116,6 +122,23 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertTrue(src.contains("createMain"), "custom createMain required")
         XCTAssertFalse(src.contains("ToolbarItem(placement: .confirmationAction)"), "system Done toolbar not Android create chrome")
         XCTAssertFalse(src.contains("ToolbarItem(placement: .cancellationAction)"), "system Close toolbar not Android create chrome")
+    }
+
+    func testRegularCreateNeverRestoresOrPersistsPreviousCreateContent() throws {
+        let src = try readShippedSource("Features/Workspace/MemoEditView.swift")
+
+        XCTAssertFalse(
+            src.contains("env.drafts.read(scope: scope, key: DraftRepository.newKey)"),
+            "regular create must not restore the previous new-note draft"
+        )
+        XCTAssertFalse(
+            src.contains("makeDraft(key: DraftRepository.newKey"),
+            "regular create must not persist content for a later create session"
+        )
+        XCTAssertTrue(
+            src.contains("env.drafts.clear(scope: scope, key: DraftRepository.newKey)"),
+            "regular create must remove legacy new-note drafts"
+        )
     }
 
     func testMemoDetailViewUsesDetailChromeAndEditFab() throws {
@@ -226,6 +249,53 @@ final class ChromeParityTests: XCTestCase {
         XCTAssertEqual(CreateMemoChrome.editorFrame, "createMemoEditorFrame")
         XCTAssertEqual(DetailMemoChrome.editFab, "detailEditFab")
         XCTAssertEqual(DetailMemoChrome.syncStatus, "detailSyncStatus")
+    }
+
+    // MARK: - Image source parity
+
+    func testCameraAccessDecisionCoversEveryPermissionState() {
+        XCTAssertEqual(
+            CameraCaptureAccess.nextStep(isCameraAvailable: false, authorizationStatus: .authorized),
+            .unavailable
+        )
+        XCTAssertEqual(
+            CameraCaptureAccess.nextStep(isCameraAvailable: true, authorizationStatus: .authorized),
+            .openCamera
+        )
+        XCTAssertEqual(
+            CameraCaptureAccess.nextStep(isCameraAvailable: true, authorizationStatus: .notDetermined),
+            .requestPermission
+        )
+        XCTAssertEqual(
+            CameraCaptureAccess.nextStep(isCameraAvailable: true, authorizationStatus: .denied),
+            .showSettings
+        )
+        XCTAssertEqual(
+            CameraCaptureAccess.nextStep(isCameraAvailable: true, authorizationStatus: .restricted),
+            .showSettings
+        )
+    }
+
+    func testCameraFilenameIsStableAndUploadFriendly() {
+        let date = Date(timeIntervalSince1970: 0)
+        XCTAssertEqual(ImagePickerData.cameraFilename(at: date), "photo-19700101T000000Z.jpg")
+    }
+
+    func testCameraCoordinatorSettlesOnlyOnce() {
+        var callbackCount = 0
+        let coordinator = SystemCameraPicker.Coordinator { _ in callbackCount += 1 }
+        coordinator.finish(.cancelled)
+        coordinator.finish(.failed("late callback"))
+        XCTAssertEqual(callbackCount, 1)
+    }
+
+    func testMemoEditorOffersCameraAndLibrarySources() throws {
+        let source = try readShippedSource("Features/Workspace/MemoEditView.swift")
+        XCTAssertTrue(source.contains("showImageSourcePicker = true"))
+        XCTAssertTrue(source.contains("SystemCameraPicker"))
+        XCTAssertTrue(source.contains("SystemImagePicker"))
+        XCTAssertTrue(source.contains("从相册选择"))
+        XCTAssertTrue(source.contains("拍照"))
     }
 
     // MARK: - Helpers
